@@ -1,0 +1,28 @@
+{
+  "manifest_version": 3,
+  "name": "Flow Character Prompter",
+  "version": "0.1.0",
+  "description": "Stage 1: Validate character-aware prompt insertion in Google Flow (labs.google/fx).",
+  "permissions": ["activeTab", "scripting", "downloads", "storage", "sidePanel"],
+  "host_permissions": ["https://labs.google/*"],
+  "background": { "service_worker": "background.js" },
+  "action": {
+    "default_title": "Flow Character Prompter"
+  },
+  "side_panel": {
+    "default_path": "popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://labs.google/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://labs.google/*"],
+      "js": ["main-world.js"],
+      "run_at": "document_idle",
+      "world": "MAIN"
+    }
+  ]
+}

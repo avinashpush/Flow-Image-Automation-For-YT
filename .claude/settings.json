@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(node --check /Users/avinashpushparaj/Claude-Flow-Extension/content.js)",
+      "Bash(node --check /Users/avinashpushparaj/Claude-Flow-Extension/main-world.js)",
+      "Bash(node --check /Users/avinashpushparaj/Claude-Flow-Extension/background.js)",
+      "Bash(node --check /Users/avinashpushparaj/Claude-Flow-Extension/popup.js)"
+    ]
+  }
+}
