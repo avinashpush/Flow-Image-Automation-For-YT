@@ -225,6 +225,75 @@ window.addEventListener(FP_REQ, function (evt) {
         break;
       }
 
+      // ── Insert one known character mention, entirely skipping the picker ───
+      //
+      // For characters whose characterServerId is already known (CHARACTER_ID_MAP
+      // in content.js), there is no need to open the "@" picker, type into
+      // Virtuoso, or click "Add to Prompt" at all — all of which have proven
+      // flaky (typed filtering stops working after the first mention per page
+      // load, and a failed/dangling picker popover has been observed to crash
+      // Flow's own React tree via a stale Radix onCloseAutoFocus). This command
+      // inserts the mention node directly at the current selection (same node
+      // shape the real picker produces — see slate:build) and repositions the
+      // selection to the text node immediately after the chip, so a subsequent
+      // insertText() in content.js lands in the right place.
+      case 'slate:insert-mention': {
+        const { characterServerId, displayText } = payload || {};
+        if (!characterServerId || !displayText) {
+          respond(id, null, 'payload.characterServerId and payload.displayText are required');
+          break;
+        }
+
+        const mentionNode = {
+          id: uuid(),
+          type: 'AT_TAG_TYPE',
+          children: [{ text: '@' }],
+          characterServerId,
+          displayText,
+        };
+
+        // REVERTED: an earlier version of this handler called
+        // editor.select() to the document's end point (computed via
+        // getDocPoint) before inserting, to work around editor.selection
+        // being stale relative to text typed via DOM execCommand(). That
+        // made things worse — it left the DOM's actual selection/focus in a
+        // state where content.js's execCommand('insertText') calls failed
+        // completely on every subsequent segment, not just misordered. Do
+        // not reintroduce that editor.select() call without first
+        // understanding why it breaks execCommand — this whole direct-
+        // insertion path is disabled by default (CONFIG.useDirectCharacterInsertion)
+        // pending that.
+
+        // Do NOT pass {select:true} — for inline-void nodes that would place
+        // the cursor inside the void's empty text child, making the next
+        // insertText a noop (see slate:build's identical comment above).
+        editor.insertNodes([mentionNode]);
+
+        const para = editor.children[0];
+        if (!para || !Array.isArray(para.children)) {
+          respond(id, null, 'editor.children[0] has no children array after insertNodes');
+          break;
+        }
+
+        let chipIdx = -1;
+        for (let k = para.children.length - 1; k >= 0; k--) {
+          if (para.children[k].type === 'AT_TAG_TYPE') { chipIdx = k; break; }
+        }
+        if (chipIdx < 0) {
+          respond(id, null, 'AT_TAG_TYPE not found in para.children after insertNodes');
+          break;
+        }
+        if (chipIdx + 1 >= para.children.length) {
+          respond(id, null, 'chip inserted but no trailing text sibling — normalization may not have run yet');
+          break;
+        }
+
+        const point = { path: [0, chipIdx + 1], offset: 0 };
+        editor.select({ anchor: point, focus: point });
+        respond(id, { ok: true, point, children: safe(editor.children) });
+        break;
+      }
+
       // ── Clear the editor ──────────────────────────────────────────────────
       //
       // Selects the entire document then calls editor.deleteFragment() (preferred)
@@ -703,6 +772,85 @@ window.addEventListener(FP_REQ, function (evt) {
         break;
       }
 
+      // ── Extract the full character roster (name → ID) for CHARACTER_ID_MAP ──
+      //
+      // slate:inspect-picker only samples the first 2 items of any array prop
+      // it finds — enough to identify the shape, not enough to build a full
+      // name→ID map. This command does the same fiber walk from the Virtuoso
+      // item-list element, but specifically looks for an array whose items
+      // look like character records (a UUID-shaped id field alongside a
+      // string name field) and returns every item, not just a sample.
+      //
+      // Call this with the "@" picker open (any tab/filter state — it reads
+      // the underlying data array directly, not the rendered/virtualized DOM
+      // rows, so scrolling or typing a filter first is unnecessary).
+      case 'slate:extract-roster': {
+        const listEl = document.querySelector('[data-testid="virtuoso-item-list"]');
+        if (!listEl) { respond(id, null, 'Virtuoso list not found — open the picker first'); break; }
+
+        const fkR = Object.keys(listEl).find(k =>
+          k.startsWith('__reactFiber$') || k.startsWith('__reactInternalInstance$')
+        );
+        if (!fkR) { respond(id, null, 'no React fiber key on virtuoso-item-list element'); break; }
+
+        const ID_KEYS   = ['characterServerId', 'serverId', 'assetId', 'id', 'uuid'];
+        const NAME_KEYS  = ['displayText', 'name', 'label', 'title', 'characterName'];
+        const isUuid     = (v) => typeof v === 'string' &&
+          /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v);
+
+        // Tries `arr` as a direct array of character records first. If that
+        // fails but items look like Virtuoso's grouped shape
+        // (`{ tiles: [...], height }` — one entry per group, actual rows
+        // nested inside `tiles`), flattens every group's tiles and retries.
+        function tryExtract(arr, depth2 = 0) {
+          const first = arr[0];
+          if (!first || typeof first !== 'object') return null;
+
+          const idKey   = ID_KEYS.find((ik) => isUuid(first[ik]));
+          const nameKey = NAME_KEYS.find((nk) => typeof first[nk] === 'string' && first[nk].length > 0);
+          if (idKey && nameKey) {
+            return { source: 'direct', idKey, nameKey, roster: arr.map((it) => ({ name: it[nameKey], id: it[idKey] })) };
+          }
+
+          if (depth2 < 3 && Array.isArray(first.tiles)) {
+            const flat = arr.flatMap((grp) => Array.isArray(grp.tiles) ? grp.tiles : []);
+            if (flat.length) {
+              const inner = tryExtract(flat, depth2 + 1);
+              if (inner) return { ...inner, source: 'grouped-tiles' };
+            }
+          }
+          return null;
+        }
+
+        let found = null;
+        let fibR = listEl[fkR];
+        for (let depth = 0; fibR && depth < 200 && !found; depth++, fibR = fibR.return) {
+          const mp = fibR.memoizedProps;
+          if (!mp || typeof mp !== 'object') continue;
+          for (const k of Object.keys(mp)) {
+            const v = mp[k];
+            if (!Array.isArray(v) || v.length < 1) continue;
+            const extracted = tryExtract(v);
+            if (extracted && extracted.roster.length) {
+              found = { depth, prop: k, ...extracted };
+              break;
+            }
+          }
+        }
+
+        if (!found) {
+          respond(id, null, 'no array prop with id+name-shaped items found on any ancestor (including grouped "tiles" arrays) — try slate:inspect-picker to see what IS available');
+          break;
+        }
+
+        respond(id, {
+          ok: true, depth: found.depth, prop: found.prop, source: found.source,
+          idKey: found.idKey, nameKey: found.nameKey,
+          count: found.roster.length, roster: found.roster,
+        });
+        break;
+      }
+
       // ── Install a broad network interceptor (fetch + XHR) ─────────────────────
       //
       // Unlike slate:patch-network (which only captures the generate POST), this
@@ -719,24 +867,37 @@ window.addEventListener(FP_REQ, function (evt) {
         }
 
         window.__fpAllRequests = [];
+        const MAX_BODY_CHARS = 2000;
 
-        // Fetch
+        // Fetch — also captures the response body (cloned so the page's own
+        // consumption of the real Response is unaffected). Response reading is
+        // async, so it's attached to the SAME entry object after the fact;
+        // callers should re-read slate:get-requests a moment after the action
+        // they're diagnosing to give response bodies time to resolve.
         const _origFetchAll = window.fetch.bind(window);
         window.fetch = function(input, init, ...rest) {
-          try {
-            const url    = typeof input === 'string' ? input : (input?.url || '');
-            const method = (init?.method || 'GET').toUpperCase();
-            let body = null;
-            if (init?.body) {
-              try { body = typeof init.body === 'string' ? JSON.parse(init.body) : init.body; }
-              catch { body = String(init.body).slice(0, 400); }
-            }
-            window.__fpAllRequests.push({ ts: Date.now(), via: 'fetch', method, url, body });
-          } catch {}
-          return _origFetchAll(input, init, ...rest);
+          const url    = typeof input === 'string' ? input : (input?.url || '');
+          const method = (init?.method || 'GET').toUpperCase();
+          let reqBody = null;
+          if (init?.body) {
+            try { reqBody = typeof init.body === 'string' ? JSON.parse(init.body) : String(init.body).slice(0, MAX_BODY_CHARS); }
+            catch { reqBody = String(init.body).slice(0, MAX_BODY_CHARS); }
+          }
+          const entry = { ts: Date.now(), via: 'fetch', method, url, body: reqBody, response: null, responseError: null };
+          window.__fpAllRequests.push(entry);
+
+          const promise = _origFetchAll(input, init, ...rest);
+          promise.then((res) => {
+            res.clone().text().then((text) => {
+              try { entry.response = JSON.parse(text); }
+              catch { entry.response = text.slice(0, MAX_BODY_CHARS); }
+            }).catch((e) => { entry.responseError = e.message; });
+          }).catch((e) => { entry.responseError = e.message; });
+          return promise;
         };
 
-        // XHR
+        // XHR — same idea via the load event, which fires once responseText
+        // is available.
         const _origXhrOpen = XMLHttpRequest.prototype.open;
         const _origXhrSend = XMLHttpRequest.prototype.send;
         XMLHttpRequest.prototype.open = function(method, url, ...rest) {
@@ -745,19 +906,66 @@ window.addEventListener(FP_REQ, function (evt) {
           return _origXhrOpen.call(this, method, url, ...rest);
         };
         XMLHttpRequest.prototype.send = function(body) {
-          try {
-            let parsed = null;
-            if (body) { try { parsed = JSON.parse(body); } catch { parsed = String(body).slice(0, 300); } }
-            window.__fpAllRequests.push({
-              ts: Date.now(), via: 'xhr',
-              method: this.__fpXhrMethod, url: this.__fpXhrUrl, body: parsed,
-            });
-          } catch {}
+          let reqBody = null;
+          if (body) { try { reqBody = JSON.parse(body); } catch { reqBody = String(body).slice(0, MAX_BODY_CHARS); } }
+          const entry = {
+            ts: Date.now(), via: 'xhr',
+            method: this.__fpXhrMethod, url: this.__fpXhrUrl, body: reqBody, response: null, responseError: null,
+          };
+          window.__fpAllRequests.push(entry);
+          this.addEventListener('load', () => {
+            try { entry.response = JSON.parse(this.responseText); }
+            catch { entry.response = String(this.responseText || '').slice(0, MAX_BODY_CHARS); }
+          });
+          this.addEventListener('error', () => { entry.responseError = 'xhr error event'; });
           return _origXhrSend.call(this, body);
         };
 
         window.__fpAllNetPatched = true;
         respond(id, { ok: true });
+        break;
+      }
+
+      // ── Snapshot client-side storage + obviously-cache-shaped globals ────────
+      //
+      // If a real "Add to Prompt" click registers a character somewhere other
+      // than a network call (a Zustand/Redux store, a plain in-memory cache
+      // hung off window, IndexedDB), a network capture alone won't see it.
+      // This grabs localStorage, sessionStorage, and any enumerable window
+      // property whose name suggests a store/cache, so two snapshots (before
+      // and after a real click) can be diffed by the caller.
+      case 'slate:snapshot-state': {
+        const snap = { ts: Date.now(), localStorage: {}, sessionStorage: {}, windowKeys: {} };
+
+        try {
+          for (let i = 0; i < localStorage.length; i++) {
+            const k = localStorage.key(i);
+            snap.localStorage[k] = localStorage.getItem(k);
+          }
+        } catch (e) { snap.localStorageError = e.message; }
+
+        try {
+          for (let i = 0; i < sessionStorage.length; i++) {
+            const k = sessionStorage.key(i);
+            snap.sessionStorage[k] = sessionStorage.getItem(k);
+          }
+        } catch (e) { snap.sessionStorageError = e.message; }
+
+        const CACHE_NAME_RE = /cache|store|query|character|trpc|state|redux|zustand/i;
+        try {
+          for (const k of Object.getOwnPropertyNames(window)) {
+            if (!CACHE_NAME_RE.test(k)) continue;
+            if (k.startsWith('__fp')) continue; // our own instrumentation
+            try {
+              const v = window[k];
+              if (v == null || typeof v === 'function') continue;
+              const json = JSON.stringify(v, (_key, val) => (typeof val === 'function' ? '[function]' : val));
+              snap.windowKeys[k] = json ? JSON.parse(json) : String(v);
+            } catch { snap.windowKeys[k] = '[unserializable]'; }
+          }
+        } catch (e) { snap.windowKeysError = e.message; }
+
+        respond(id, snap);
         break;
       }
 
@@ -771,6 +979,30 @@ window.addEventListener(FP_REQ, function (evt) {
         const out     = sinceTs ? allReqs.filter(r => r.ts >= sinceTs) : allReqs;
         if (payload?.clear) window.__fpAllRequests = [];
         respond(id, { count: out.length, requests: out });
+        break;
+      }
+
+      // ── Retrieve (and optionally clear) the Zustand devtools action log ──────
+      //
+      // Populated by redux-devtools-shim.js (a separate document_start /
+      // MAIN-world content script — see its own header comment for why the
+      // timing matters). Requires that shim to have been in place BEFORE this
+      // page load; if window.__fpDevtoolsPatched is false, the shim never
+      // installed in time (e.g. the extension was reloaded but the Flow tab
+      // wasn't) and this will just return an empty log.
+      //
+      // payload.since  (number, ms timestamp) — return only entries after this time
+      // payload.clear  (boolean)              — empty the log after reading
+      case 'slate:get-devtools-log': {
+        if (!window.__fpDevtoolsPatched) {
+          respond(id, null, 'devtools shim never installed for this page load — reload the Flow tab (not just the extension) after installing/updating redux-devtools-shim.js');
+          break;
+        }
+        const allEntries = window.__fpDevtoolsLog || [];
+        const sinceTs2    = payload?.since;
+        const out2        = sinceTs2 ? allEntries.filter(e => e.ts >= sinceTs2) : allEntries;
+        if (payload?.clear) window.__fpDevtoolsLog = [];
+        respond(id, { count: out2.length, entries: out2 });
         break;
       }
 

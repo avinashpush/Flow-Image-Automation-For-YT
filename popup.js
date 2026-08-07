@@ -16,6 +16,10 @@ const runQueueBtn    = document.getElementById('run-queue-btn');
 const stopQueueBtn   = document.getElementById('stop-queue-btn');
 const queueProgressEl = document.getElementById('queue-progress');
 const parseErrorsEl  = document.getElementById('parse-errors');
+const extractRosterBtn = document.getElementById('extract-roster-btn');
+const diagnosePickerBtn = document.getElementById('diagnose-picker-btn');
+const harvestIdsBtn = document.getElementById('harvest-ids-btn');
+const diagnoseSidefxBtn = document.getElementById('diagnose-sidefx-btn');
 
 // ─── PROMPT SCRIPT PARSER ─────────────────────────────────────────────────────────
 //
@@ -245,6 +249,9 @@ runQueueBtn.addEventListener('click', async () => {
       } else if (result.stopped) {
         setStatus(`Queue stopped after ${result.completed} of ${items.length} — ${summary}.`, 'warn');
         appendLog(`Queue stopped — ${result.completed} run, ${summary}.`, 'warn');
+      } else if (result.crashed) {
+        setStatus(`Flow crashed after ${result.completed} of ${items.length} — reload the tab and resume.`, 'error');
+        appendLog(`Queue halted — Flow's page crashed (editor disappeared). Reload the Flow tab, then re-run starting from item ${result.completed + 1}.`, 'error');
       } else {
         const idx = result.failedIndex != null ? ` at item ${result.failedIndex + 1}` : '';
         setStatus(`Queue error${idx}: ${result.error}`, 'error');
@@ -271,6 +278,197 @@ stopQueueBtn.addEventListener('click', () => {
     // will re-enable the full UI once it detects the token change and exits.
     stopQueueBtn.disabled = true;
   }
+});
+
+// ─── EXTRACT CHARACTER IDS ────────────────────────────────────────────────────────
+//
+// One-shot utility: opens the "@" picker and reads every character's name + ID
+// straight out of Virtuoso's React props (see extractCharacterRoster() /
+// slate:extract-roster), then logs "'name': 'id'," lines ready to paste into
+// CHARACTER_ID_MAP in content.js. Does not touch the queue or its port state.
+
+extractRosterBtn.addEventListener('click', async () => {
+  let tab, port;
+  try {
+    tab  = await getFlowTab();
+    port = await connectToContent(tab.id);
+  } catch (err) {
+    appendLog(`✗ ${err.message}`, 'error');
+    setStatus('Error — see log', 'error');
+    return;
+  }
+
+  extractRosterBtn.disabled = true;
+  appendLog('Extracting character roster…');
+
+  port.onMessage.addListener(function onMsg(msg) {
+    if (msg.type === 'log') {
+      appendLog(msg.status, msg.level || 'info');
+    } else if (msg.type === 'done') {
+      port.onMessage.removeListener(onMsg);
+      extractRosterBtn.disabled = false;
+      if (!msg.success) {
+        appendLog(`✗ Roster extraction failed: ${msg.error}`, 'error');
+      }
+    }
+  });
+
+  port.onDisconnect.addListener(() => {
+    extractRosterBtn.disabled = false;
+  });
+
+  port.postMessage({ action: 'extractRoster' });
+});
+
+// ─── DIAGNOSE PICKER ──────────────────────────────────────────────────────────────
+//
+// Fallback for when extractRoster can't find a matching array prop. Dumps the
+// picker's component chain, every array prop found on ancestor fibers (with a
+// 2-item sample), and any filter/query string props — see diagnosePicker() /
+// slate:inspect-picker in content.js / main-world.js.
+
+diagnosePickerBtn.addEventListener('click', async () => {
+  const characterName = window.prompt(
+    'Character name to type into the picker filter while diagnosing (any saved character works):',
+    'Danny'
+  );
+  if (!characterName) return;
+
+  let tab, port;
+  try {
+    tab  = await getFlowTab();
+    port = await connectToContent(tab.id);
+  } catch (err) {
+    appendLog(`✗ ${err.message}`, 'error');
+    setStatus('Error — see log', 'error');
+    return;
+  }
+
+  diagnosePickerBtn.disabled = true;
+  appendLog(`Diagnosing picker (filter: "${characterName}")…`);
+
+  port.onMessage.addListener(function onMsg(msg) {
+    if (msg.type === 'log') {
+      appendLog(msg.status, msg.level || 'info');
+    } else if (msg.type === 'done') {
+      port.onMessage.removeListener(onMsg);
+      diagnosePickerBtn.disabled = false;
+      if (!msg.success) {
+        appendLog(`✗ Picker diagnosis failed: ${msg.error}`, 'error');
+      }
+    }
+  });
+
+  port.onDisconnect.addListener(() => {
+    diagnosePickerBtn.disabled = false;
+  });
+
+  port.postMessage({ action: 'diagnosePicker', characterName });
+});
+
+// ─── HARVEST CHARACTER IDS (via real insertion) ──────────────────────────────────
+//
+// Fallback for when Extract Character IDs can't find a matching React prop.
+// Inserts each given name for real via the picker (clearing the editor between
+// each), then reads its true characterServerId back off the resulting chip —
+// see harvestCharacterIds() in content.js. Slower (one real insertion per
+// name) but only relies on the picker-driven insertion path already proven
+// to work throughout the queue runner.
+
+const DEFAULT_HARVEST_NAMES = [
+  'Env_Studio_Astoria', 'Env_SliceShop', 'Env_CitySt_Night', 'Env_TaxOffice',
+  'Env_BankVestibule', 'Env_CoopBoardRoom', 'Env_Brownstone_Kitchen', 'Env_AdmissionsOffice',
+  'Env_PartyLoft', 'Env_WealthOffice', 'Env_HamptonsHouse', 'Env_PhilanthropyOffice',
+  'Env_PenthouseWindow', 'Env_Lobby_Supertall', 'Env_Elevator', 'Elena', 'Theodore', 'Diane',
+].join(', ');
+
+harvestIdsBtn.addEventListener('click', async () => {
+  const raw = window.prompt(
+    'Comma-separated character names to insert and harvest IDs for (editor will be cleared before/after):',
+    DEFAULT_HARVEST_NAMES
+  );
+  if (!raw) return;
+  const names = raw.split(',').map((s) => s.trim()).filter(Boolean);
+  if (!names.length) return;
+
+  let tab, port;
+  try {
+    tab  = await getFlowTab();
+    port = await connectToContent(tab.id);
+  } catch (err) {
+    appendLog(`✗ ${err.message}`, 'error');
+    setStatus('Error — see log', 'error');
+    return;
+  }
+
+  harvestIdsBtn.disabled = true;
+  appendLog(`Harvesting IDs for ${names.length} name(s)…`);
+
+  port.onMessage.addListener(function onMsg(msg) {
+    if (msg.type === 'log') {
+      appendLog(msg.status, msg.level || 'info');
+    } else if (msg.type === 'done') {
+      port.onMessage.removeListener(onMsg);
+      harvestIdsBtn.disabled = false;
+      if (!msg.success) {
+        appendLog(`✗ Harvest failed: ${msg.error}`, 'error');
+      }
+    }
+  });
+
+  port.onDisconnect.addListener(() => {
+    harvestIdsBtn.disabled = false;
+  });
+
+  port.postMessage({ action: 'harvestRoster', names });
+});
+
+// ─── DIAGNOSE ADD-TO-PROMPT SIDE EFFECTS ─────────────────────────────────────────
+//
+// Snapshots network activity + client-side storage/caches before and after a
+// real, picker-driven character insertion (the proven-correct path), then
+// diffs everything — see diagnoseAddToPromptSideEffects() in content.js.
+// Goal: find whatever "Add to Prompt" does beyond mutating the Slate document,
+// since direct node insertion (bypassing the picker) produces a node that
+// looks correct but gets silently flattened to plain text before generation.
+
+diagnoseSidefxBtn.addEventListener('click', async () => {
+  const characterName = window.prompt(
+    'Character name to insert via the real picker while diagnosing (any saved character works):',
+    'Danny'
+  );
+  if (!characterName) return;
+
+  let tab, port;
+  try {
+    tab  = await getFlowTab();
+    port = await connectToContent(tab.id);
+  } catch (err) {
+    appendLog(`✗ ${err.message}`, 'error');
+    setStatus('Error — see log', 'error');
+    return;
+  }
+
+  diagnoseSidefxBtn.disabled = true;
+  appendLog(`Diagnosing Add-to-Prompt side effects (character: "${characterName}")…`);
+
+  port.onMessage.addListener(function onMsg(msg) {
+    if (msg.type === 'log') {
+      appendLog(msg.status, msg.level || 'info');
+    } else if (msg.type === 'done') {
+      port.onMessage.removeListener(onMsg);
+      diagnoseSidefxBtn.disabled = false;
+      if (!msg.success) {
+        appendLog(`✗ Side-effect diagnosis failed: ${msg.error}`, 'error');
+      }
+    }
+  });
+
+  port.onDisconnect.addListener(() => {
+    diagnoseSidefxBtn.disabled = false;
+  });
+
+  port.postMessage({ action: 'diagnoseSideEffects', characterName });
 });
 
 // ─── PROMPT STATUS LIST ──────────────────────────────────────────────────────────

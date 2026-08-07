@@ -443,6 +443,10 @@ dramatic lighting, shallow depth of field"
     <div class="buttons">
       <button id="run-queue-btn">Run Queue</button>
       <button id="stop-queue-btn" disabled>Stop</button>
+      <button id="extract-roster-btn" title="Read every character's name and ID from the picker in one shot, for CHARACTER_ID_MAP">Extract Character IDs</button>
+      <button id="diagnose-picker-btn" title="Dump the picker's React fiber tree (component names, array props, query props) when the roster extraction can't find a matching prop">Diagnose Picker</button>
+      <button id="harvest-ids-btn" title="Insert each given character name for real via the picker, one at a time, and read back its true characterServerId — slower than Extract Character IDs but doesn't depend on finding the right React prop">Harvest IDs (slow)</button>
+      <button id="diagnose-sidefx-btn" title="Snapshot network activity and client-side storage/caches before and after a real picker-driven character insertion, then diff, to find what 'Add to Prompt' does beyond mutating the Slate document">Diagnose Add-to-Prompt Side Effects</button>
     </div>
 
     <div id="queue-progress" class="queue-progress" hidden></div>
