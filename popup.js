@@ -20,6 +20,7 @@ const extractRosterBtn = document.getElementById('extract-roster-btn');
 const diagnosePickerBtn = document.getElementById('diagnose-picker-btn');
 const harvestIdsBtn = document.getElementById('harvest-ids-btn');
 const diagnoseSidefxBtn = document.getElementById('diagnose-sidefx-btn');
+const copyLogBtn = document.getElementById('copy-log-btn');
 
 // ─── PROMPT SCRIPT PARSER ─────────────────────────────────────────────────────────
 //
@@ -469,6 +470,25 @@ diagnoseSidefxBtn.addEventListener('click', async () => {
   });
 
   port.postMessage({ action: 'diagnoseSideEffects', characterName });
+});
+
+// ─── COPY LOG ────────────────────────────────────────────────────────────────────
+//
+// Selecting text inside the scrolling log panel is fiddly and truncates easily,
+// which repeatedly cost us the tail of a run — exactly where failures appear.
+// One click copies the whole thing verbatim.
+
+copyLogBtn.addEventListener('click', async () => {
+  const text = logEl.innerText.trim();
+  if (!text) return;
+  const original = copyLogBtn.textContent;
+  try {
+    await navigator.clipboard.writeText(text);
+    copyLogBtn.textContent = `Copied ${text.split('\n').length} lines`;
+  } catch (err) {
+    copyLogBtn.textContent = 'Copy failed';
+  }
+  setTimeout(() => { copyLogBtn.textContent = original; }, 2000);
 });
 
 // ─── PROMPT STATUS LIST ──────────────────────────────────────────────────────────

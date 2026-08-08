@@ -348,6 +348,14 @@
       letter-spacing: 0.06em;
       color: var(--dim);
     }
+    /* Compact so it sits inline with the LOG label rather than dominating it. */
+    #copy-log-btn {
+      padding: 3px 9px;
+      font-size: 10px;
+      background: rgba(255, 255, 255, 0.08);
+      color: var(--dim);
+    }
+    #copy-log-btn:hover { background: rgba(255, 255, 255, 0.14); }
 
     #log {
       height: 200px;
@@ -460,6 +468,7 @@ dramatic lighting, shallow depth of field"
     <!-- ── Log ── -->
     <div class="log-header">
       <span class="log-label">Log</span>
+      <button id="copy-log-btn" title="Copy the entire log to the clipboard">Copy Log</button>
     </div>
 
     <div id="log">

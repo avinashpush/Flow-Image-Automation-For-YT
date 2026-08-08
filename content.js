@@ -115,6 +115,29 @@ const CONFIG = {
   // it is rejected wholesale rather than downloaded.
   maxOutputsPerPrompt: 1,
 
+  // Dump the full captured generate-request body to the log. Off by default:
+  // the captured request is normally reCAPTCHA telemetry that serialises to
+  // thousands of numbers and truncates long queue logs.
+  logFullNetworkPayload: false,
+
+  // Extra time to keep watching after a generation times out. Flow may still
+  // be working; without this, a late image lands during the NEXT prompt's
+  // detection window and gets saved under the wrong timestamp, shifting
+  // results. Long enough to catch a slow generation, short enough not to
+  // stall the queue.
+  postTimeoutGraceMs: 60000,
+
+  // Emit the low-level diagnostic trace (selection snapshots, [ck*]
+  // checkpoints, per-poll settle output, full slate:children dumps, etc).
+  //
+  // These were invaluable while reverse-engineering Flow's editor, but they
+  // produce ~100 lines per prompt — a 10-prompt run overflows the log panel
+  // and gets truncated before any FAILURE is visible, which is exactly when
+  // the log matters most. Off by default so a whole run fits; turn on when
+  // debugging a specific insertion problem. See NOISE_RE in the port handler
+  // for what gets filtered.
+  verboseLogging: false,
+
   // OFF by default — see the big warning comment on insertCharacterDirect().
   // Direct Slate node insertion (skipping the "@" picker) looked correct in
   // every check this extension makes, but produced a broken generation: the
@@ -387,6 +410,87 @@ function clearPickerSearchQuery(log) {
   log(`    [search] Cleared picker search box`);
 }
 
+// Names proven absent from the asset library during this queue run.
+//
+// A name that survives the inline filter, the search box, the "All" tab and a
+// full scroll-scan is missing, not merely slow to appear. Re-running that whole
+// escalation for every prompt that mentions it wastes ~10s each time — one run
+// spent 30s failing on "CardTemplate" three separate times. Remember the
+// verdict and fail fast on repeats. Cleared at the start of each queue run so a
+// name added to Flow between runs is picked up.
+const missingAssetNames = new Set();
+
+// Click one of the picker's asset-type tabs ("All" | "Images" | "Characters" |
+// "Avatar" | "Uploads"). Returns true if that tab ended up selected.
+//
+// insertCharacterImpl forces "Characters" on every open to keep the list small,
+// but that HIDES every other asset type — an image or upload referenced with
+// @{Name} can then never be found no matter how it's searched. Observed with
+// "@{CardTemplate}" ("Reference image: @{CardTemplate} — match its exact
+// background style…"), which failed three times in one run with 0 rows mounted
+// because it is an image, not a character.
+async function switchPickerTab(label, log) {
+  const tab = [...document.querySelectorAll('[role="tab"]')]
+    .find((t) => t.textContent.trim().includes(label));
+  if (!tab) {
+    log(`    [tab] No "${label}" tab found`, 'warn');
+    return false;
+  }
+  if (tab.getAttribute('aria-selected') === 'true') return true;
+
+  for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+    tab.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
+  }
+  try {
+    await waitFor(() => tab.getAttribute('aria-selected') === 'true',
+      { timeout: 1000, label: `"${label}" tab selected` });
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+// When an exact name can't be found, re-query the picker with a progressively
+// shorter prefix and report what the library actually contains.
+//
+// Motivation: a queue run failed 5 times on "Env_CastingOfficeFinal" while
+// every other name resolved in ~400ms. A name that never appears under any
+// search is almost always a spelling/rename mismatch between the prompt script
+// and the asset library — but the old error just said "not found", leaving no
+// way to discover the real name without hunting through Flow's UI by hand.
+// This turns that dead end into "here's what does exist starting with Env_Cast".
+//
+// Returns an array of candidate display names (possibly empty).
+async function suggestSimilarNames(name, log) {
+  // Search across ALL asset types, not just characters — the missing name may
+  // well be an image or upload, and suggesting only characters would hide it.
+  await switchPickerTab('All', log);
+
+  // Try successively broader prefixes: the segment before the last underscore,
+  // then the first segment, then the first 5 characters.
+  const parts = name.split('_');
+  const probes = [];
+  if (parts.length > 1) probes.push(parts.slice(0, -1).join('_'));
+  if (parts.length > 1) probes.push(parts[0] + '_');
+  probes.push(name.slice(0, 5));
+
+  for (const probe of probes.filter((p, i, a) => p && a.indexOf(p) === i)) {
+    if (!setPickerSearchQuery(probe, log)) return [];
+    await sleep(900); // let the filtered results settle
+
+    const names = [...document.querySelectorAll(SEL.option)]
+      .map((o) => readOptionName(o))
+      .filter((n) => n && n.toLowerCase() !== 'person');
+
+    if (names.length) {
+      log(`    [suggest] Assets matching "${probe}": ${names.join(', ')}`, 'warn');
+      return names;
+    }
+    log(`    [suggest] Nothing matched "${probe}"`);
+  }
+  return [];
+}
+
 // Find the element whose scrollTop actually drives Virtuoso's row mounting.
 // Returns { el, via } or null.
 //
@@ -466,6 +570,8 @@ async function scrollAndScanForOption(name, exact, log, deadlineTs) {
   let lastScrollTop = -1;
   let step = 0;
   let dwellUsed = false;
+  let lastMounted = null;
+  let staleMountCount = 0;
   while (Date.now() < deadlineTs) {
     step++;
     const match = findMatch();
@@ -473,7 +579,24 @@ async function scrollAndScanForOption(name, exact, log, deadlineTs) {
       log(`    [scroll] Found "${name}" after ${step} scroll step(s) (scrollTop=${container.scrollTop})`);
       return match;
     }
-    log(`    [scroll] step ${step}: scrollTop=${container.scrollTop}/${container.scrollHeight} — ${mountedSummary()}`);
+    const mounted = mountedSummary();
+    log(`    [scroll] step ${step}: scrollTop=${container.scrollTop}/${container.scrollHeight} — ${mounted}`);
+
+    // Give up early when scrolling isn't actually revealing anything new. With
+    // a search query applied that matches nothing, Flow keeps a single
+    // placeholder row mounted no matter how far we scroll — the old code still
+    // ground through all 18 steps plus a 2.5s dwell, ~8s wasted per failure,
+    // five times in one run. Identical mounted rows across several steps means
+    // there is nothing further to find.
+    if (mounted === lastMounted) {
+      if (++staleMountCount >= 4) {
+        log(`    [scroll] Mounted rows unchanged across ${staleMountCount} steps — scrolling is revealing nothing new; stopping early`, 'warn');
+        return null;
+      }
+    } else {
+      staleMountCount = 0;
+      lastMounted = mounted;
+    }
 
     if (container.scrollTop === lastScrollTop) {
       // Bottom reached. Flow's asset list lazy-loads more pages when the
@@ -543,6 +666,7 @@ async function waitForOptionStable(name, exact, log, totalTimeoutMs, stabilityCa
   let   pollCount = 0;
   let   searchTried  = false;  // search-box fallback runs at most once per call
   let   searchTriedAt = 0;     // when the search query was set (for its settle window)
+  let   allTabTried  = false;  // "All" tab widening runs at most once per call
   let   scrollScanDone = false; // scroll-scan fallback runs at most once per call
 
   // ── DIAG: entry ───────────────────────────────────────────────────────────
@@ -572,7 +696,15 @@ async function waitForOptionStable(name, exact, log, totalTimeoutMs, stabilityCa
     const pastCap    = (Date.now() - start) >= stabilityCapMs;
 
     // ── DIAG: per-poll ────────────────────────────────────────────────────
-    log(`    [settle:DIAG] poll #${pollCount} +${Date.now() - start}ms — opts=${opts.length} stable=${isStable} pastCap=${pastCap} snap="${snap}"`);
+    // The full roster snapshot is ~300 chars and was printed on every 100ms
+    // poll, for every character, in every prompt — it buried real failures and
+    // truncated long queue logs. Print it only when the option set actually
+    // changes; otherwise just note the poll.
+    if (snap !== prevSnap) {
+      log(`    [settle:DIAG] poll #${pollCount} +${Date.now() - start}ms — opts=${opts.length} stable=${isStable} pastCap=${pastCap} snap="${snap.replace(/\x00/g, '|')}"`);
+    } else {
+      log(`    [settle:DIAG] poll #${pollCount} +${Date.now() - start}ms — opts=${opts.length} unchanged stable=${isStable} pastCap=${pastCap}`);
+    }
 
     if (pastCap && !isStable && !capLogged) {
       capLogged = true;
@@ -616,7 +748,25 @@ async function waitForOptionStable(name, exact, log, totalTimeoutMs, stabilityCa
         continue;
       }
 
-      // Fallback 2: actively scroll the Virtuoso list so rows further down
+      // Fallback 2: widen to the "All" tab and search again.
+      //
+      // insertCharacterImpl forces the "Characters" tab, which hides images,
+      // uploads and every other asset type. Any @{Name} referring to a
+      // non-character asset is therefore invisible regardless of how it's
+      // searched. Switching to "All" (keeping the same query) makes those
+      // reachable. Only worth doing once per call.
+      if (isStable && !allTabTried) {
+        allTabTried = true;
+        log(`    [settle] Not found under "Characters" — widening to the "All" tab (the name may be an image or upload, not a character)…`);
+        if (await switchPickerTab('All', log)) {
+          setPickerSearchQuery(name, log); // re-apply query; tab switch can reset it
+          searchTriedAt = Date.now();      // give the widened results time to settle
+          prevSnap = null;                 // re-arm stability detection
+          continue;
+        }
+      }
+
+      // Fallback 3: actively scroll the Virtuoso list so rows further down
       // get mounted (it only renders rows in view, and the roster lazy-loads
       // additional pages at the bottom). Only attempted once per call, and
       // only once the list has genuinely settled.
@@ -629,9 +779,22 @@ async function waitForOptionStable(name, exact, log, totalTimeoutMs, stabilityCa
           return scrolled;
         }
         log(`    [settle] Scroll-scan completed without a match`, 'warn');
+
+        // Before giving up, tell the user what the library DOES contain under
+        // a similar prefix — a name that survives all three lookup paths is
+        // almost certainly misspelled or renamed, not missing.
+        const suggestions = await suggestSimilarNames(name, log);
+        const hint = suggestions.length
+          ? ` Did you mean one of: ${suggestions.join(', ')}?`
+          : ` No assets matched a shortened prefix either — check the name in Flow's asset library.`;
+
+        // Every lookup path is exhausted — record the verdict so other prompts
+        // using this same name fail instantly instead of repeating all of it.
+        missingAssetNames.add(name.toLowerCase());
+
         throw new Error(
-          `character option "${name}" not found — tried inline filter, the picker search box, ` +
-          `and a full scroll-scan of the list, after ${Date.now() - start}ms`
+          `asset "${name}" does not exist in this project's library ` +
+          `(tried inline filter, search box, the "All" tab, and a full scroll-scan).${hint}`
         );
       }
     }
@@ -984,6 +1147,14 @@ async function insertCharacterDirect(name, characterServerId, log) {
 }
 
 async function insertCharacter(name, log, opts) {
+  // Already proven missing earlier in this run — don't repeat the ~10s
+  // escalation (inline filter → search box → All tab → scroll-scan → suggest).
+  if (missingAssetNames.has(name.toLowerCase())) {
+    throw new Error(
+      `asset "${name}" was already confirmed missing from this project's library earlier in this run — skipping the lookup`
+    );
+  }
+
   const knownId = CONFIG.useDirectCharacterInsertion ? CHARACTER_ID_MAP[name.toLowerCase()] : null;
   if (knownId) {
     try {
@@ -1226,6 +1397,13 @@ async function insertCharacterImpl(name, log, { exact = true } = {}) {
     }
   }
 
+  // Start from a clean search box. Flow does not reset it when the popover
+  // closes, so a query left over from the PREVIOUS character would still be
+  // filtering this list. Clearing here is safe because nothing is selected
+  // yet — unlike clearing later, between selecting an option and committing
+  // it, which resets the selection and commits the wrong character.
+  clearPickerSearchQuery(log);
+
   // ── Type the name to filter the Virtuoso list ─────────────────────────────
   //
   // insertText() no longer calls focusEditor(), so the focus stays on the editor
@@ -1309,11 +1487,12 @@ async function insertCharacterImpl(name, log, { exact = true } = {}) {
       .find((b) => b.textContent.trim().toLowerCase() === SEL.addToPromptText.toLowerCase());
   }, { label: '"Add to Prompt" button' });
 
-  // Clear any query we typed into the picker's search box BEFORE committing.
-  // The box isn't reset when the popover closes, so leaving it set would
-  // filter the next picker open by the previous character's name and leaves
-  // the popover's React state dirty across open/close cycles.
-  clearPickerSearchQuery(log);
+  // DO NOT clear the search box here. Doing so between selecting the option
+  // and committing it re-renders the list back to the full roster, which
+  // resets the picker's selected option (the first row becomes
+  // aria-selected) — so "Add to Prompt" then commits the WRONG character.
+  // Observed: "@{Vance}" committed as the roster's top entry instead.
+  // The box is cleared at the START of each picker interaction instead.
 
   log(`    Clicking "Add to Prompt"…`);
   for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
@@ -1349,13 +1528,43 @@ async function insertCharacterImpl(name, log, { exact = true } = {}) {
     log(`    ⚠ Popover wrapper still present after ${CONFIG.popoverCloseSettleMs}ms — proceeding anyway`, 'warn');
   }
 
-  // Dump editor.children via MAIN-world bridge. This reveals the mention node's
-  // exact schema — type, characterId/name fields, children structure. Once we
-  // know the schema we can call slate:insert-nodes directly, bypassing the picker.
+  // Dump editor.children via MAIN-world bridge, and VERIFY the chip that was
+  // just committed is actually the character we asked for.
+  //
+  // The picker can commit a different character than the one selected — e.g.
+  // anything that re-renders the list between selecting a row and clicking
+  // "Add to Prompt" resets the selection to the top of the roster. That
+  // produced a silently wrong image (asked for "Vance", got the roster's
+  // first entry) with no error anywhere. Generation is slow and costly, so
+  // fail loudly here instead: the queue marks this prompt failed and moves
+  // on, rather than spending a generation on the wrong character.
   try {
     const children = await slateRequest('slate:children');
     log(`    [slate:children] ${JSON.stringify(children)}`);
+
+    const chips = [];
+    (function walk(nodes) {
+      for (const n of nodes || []) {
+        if (n.type === 'AT_TAG_TYPE' && n.displayText) chips.push(n.displayText);
+        if (Array.isArray(n.children)) walk(n.children);
+      }
+    })(children);
+
+    const committed = chips[chips.length - 1];
+    if (!committed) {
+      throw new Error(`no character chip found in the editor after committing "${name}"`);
+    }
+    if (committed.toLowerCase() !== name.toLowerCase()) {
+      throw new Error(
+        `picker committed the wrong character: asked for "${name}" but the editor now ends with "${committed}". ` +
+        `Aborting so this prompt isn't generated with the wrong character.`
+      );
+    }
+    log(`    ✓ Verified committed chip is "${committed}"`);
   } catch (e) {
+    // A verification failure must propagate — insertCharacter's wrapper closes
+    // the picker and the queue marks the prompt failed.
+    if (/wrong character|no character chip/.test(e.message)) throw e;
     log(`    [slate:children] err: ${e.message}`, 'warn');
   }
 
@@ -2745,12 +2954,23 @@ async function clickGenerate(log) {
   log(`✓ Generation started (signal: ${signal})`, 'success');
 
   // Retrieve the network payload captured by the interceptor.
+  //
+  // The captured request is usually reCAPTCHA's byte-array telemetry, which
+  // serialises to thousands of numbers and buried the actually-useful queue
+  // output — long runs got truncated before any failure was visible. Log a
+  // short summary instead; set CONFIG.logFullNetworkPayload to see the body.
   try {
     await sleep(300);
     const netRes = await slateRequest('slate:get-network', null, 2000);
     if (netRes.request) {
       log(`  [network:url] ${netRes.request.url}`);
-      log(`  [network:payload] ${JSON.stringify(netRes.request.body)}`);
+      if (CONFIG.logFullNetworkPayload) {
+        log(`  [network:payload] ${JSON.stringify(netRes.request.body)}`);
+      } else {
+        const body = netRes.request.body;
+        const size = body == null ? 0 : JSON.stringify(body).length;
+        log(`  [network:payload] ${size} bytes (suppressed — set CONFIG.logFullNetworkPayload to dump)`);
+      }
     } else {
       log('  [network:payload] (none — interceptor did not see the request)');
     }
@@ -2848,6 +3068,10 @@ let queueToken = 0;
 //   { error: string, completed: N, failedIndex: N }  — step threw or returned falsy
 async function runQueue(promptItems, delayMinMs, delayMaxMs, log, notify = () => {}) {
   const myToken = queueToken;
+
+  // Fresh verdicts each run — a name missing last time may have been added to
+  // Flow since, and we don't want a stale "missing" result to skip it forever.
+  missingAssetNames.clear();
 
   for (let i = 0; i < promptItems.length; i++) {
     // ── Cancellation check ────────────────────────────────────────────────────
@@ -2948,8 +3172,37 @@ async function runQueue(promptItems, delayMinMs, delayMaxMs, log, notify = () =>
           notify({ type: 'promptStatus', index: i, status: 'failed' });
         }
       } else {
-        log(`[queue] ⚠ Timed out (120s) — no fail card — skipping download, moving on`, 'warn');
-        notify({ type: 'promptStatus', index: i, status: 'failed' });
+        // A timeout does NOT mean the generation was abandoned — Flow may
+        // still be working on it. If its image lands while the NEXT prompt is
+        // waiting for output, it looks brand new and gets downloaded under the
+        // next prompt's timestamp, silently shifting results. Give it a bounded
+        // grace period here: if the image arrives, save it under THIS prompt's
+        // timestamp (recovering it rather than losing it); if it doesn't,
+        // absorb whatever is on screen so it can't be claimed later.
+        log(`[queue] ⚠ Timed out (120s) — generation may still be running; watching ${CONFIG.postTimeoutGraceMs / 1000}s more so a late image isn't attributed to the next prompt`, 'warn');
+        let recovered = null;
+        try {
+          recovered = await waitForOutput(beforeSrcs, CONFIG.postTimeoutGraceMs);
+        } catch (e) {
+          log(`[queue] grace-period watch threw: ${e.message}`, 'warn');
+        }
+
+        if (recovered && recovered.done && recovered.urls.length) {
+          log(`[queue] Late output arrived for item ${i + 1} — saving under its own timestamp`, 'success');
+          try {
+            await saveGeneratedImages(recovered.urls, timestamp, log);
+            notify({ type: 'promptStatus', index: i, status: 'done' });
+          } catch (e) {
+            log(`[queue] ✗ saveGeneratedImages threw on late output: ${e.message}`, 'error');
+            notify({ type: 'promptStatus', index: i, status: 'failed' });
+          }
+        } else {
+          // Nothing arrived. Absorb the current gallery so any straggler that
+          // shows up later is already known and can't pose as new output.
+          collectCurrentOutputSrcs();
+          log(`[queue] No late output — item ${i + 1} marked failed; gallery state absorbed`, 'warn');
+          notify({ type: 'promptStatus', index: i, status: 'failed' });
+        }
       }
     }
 
@@ -2980,7 +3233,56 @@ async function runQueue(promptItems, delayMinMs, delayMaxMs, log, notify = () =>
 chrome.runtime.onConnect.addListener((port) => {
   if (port.name !== 'flow-prompter') return;
 
+  // Low-level diagnostic lines, filtered out unless CONFIG.verboseLogging.
+  // Matched after stripping indentation and any "[3/6] " segment prefix.
+  // Warnings and errors are NEVER filtered — a failure must always be visible.
+  const NOISE_RE = new RegExp(
+    '^(' + [
+      // Raw state dumps
+      '\\[slate:children\\]',
+      '\\[slate:model\\]',
+      '\\[settle:DIAG\\]',
+      '\\[placeCaret:DIAG\\]',
+      '\\[ck\\d',
+      '\\[att \\d',
+      'Sel \\[',
+      'Slate\\[',
+      'removeStrayTrigger',
+      'Editor (before|after) picker-open',
+      'Editor DOM:',
+      'Editor:',
+      '✓ Editor full text',
+      '\\[network:payload\\]',
+      // Routine step markers — the surrounding success/failure lines already
+      // say whether each stage worked, so these only add volume.
+      '\\[A\\] Firing',
+      '\\[tab\\] (poll #|✓ |Characters tab)',
+      'picker opened',
+      'Typing "',
+      'Waiting for option ',
+      'Matched option for',
+      'Clicking option',
+      'Waiting for "Add to Prompt"',
+      'Clicking "Add to Prompt"',
+      '✓ Popover wrapper gone',
+      '✓ Chip DOM node confirmed',
+      '✓ Character .* inserted',
+      '✓ Slate (editor found|model cleared)',
+      '✓ MAIN-world bridge ready',
+      '── Insertion complete',
+      'Looking for generate button',
+      '✓ Submit button enabled',
+      'Invoking React handler',
+      'fiber click OK',
+      '\\[network:url\\]',
+    ].join('|') + ')'
+  );
+
   const log = (status, level = 'info') => {
+    if (!CONFIG.verboseLogging && level !== 'warn' && level !== 'error') {
+      const bare = String(status).trim().replace(/^\[\d+\/\d+\]\s*/, '');
+      if (NOISE_RE.test(bare)) return;
+    }
     try { port.postMessage({ type: 'log', status, level }); } catch (_) {}
   };
 
